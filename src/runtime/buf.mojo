@@ -50,10 +50,35 @@ def put_i64(mut b: List[Byte], v: Int):
 
 
 def put_bytes[origin: ImmOrigin](mut b: List[Byte], raw: Span[Byte, origin]):
+    extend_span(b, raw)
+
+
+def copy_span[origin: ImmOrigin](raw: Span[Byte, origin], off: Int, n: Int) -> List[Byte]:
+    var out = List[Byte]()
+    if n <= 0:
+        return out^
+    out.resize(n, Byte(0))
     var i = 0
-    while i < len(raw):
-        b.append(raw[i])
+    while i < n:
+        out[i] = raw[off + i]
         i += 1
+    return out^
+
+
+def extend_span[origin: ImmOrigin](mut dst: List[Byte], raw: Span[Byte, origin]):
+    var base = len(dst)
+    var n = len(raw)
+    if n == 0:
+        return
+    dst.resize(base + n, Byte(0))
+    var i = 0
+    while i < n:
+        dst[base + i] = raw[i]
+        i += 1
+
+
+def extend_list(mut dst: List[Byte], raw: List[Byte]):
+    extend_span(dst, Span(raw))
 
 
 def u8_at[origin: ImmOrigin](raw: Span[Byte, origin], i: Int) raises DecodeError -> Int:
@@ -151,12 +176,7 @@ def copy_list[origin: ImmOrigin](raw: Span[Byte, origin]) -> List[Byte]:
 
 
 def slice_list(data: List[Byte], off: Int, n: Int) -> List[Byte]:
-    var out = List[Byte]()
-    var i = 0
-    while i < n:
-        out.append(data[off + i])
-        i += 1
-    return out^
+    return copy_span(Span(data), off, n)
 
 
 def utf8_ok[origin: ImmOrigin](raw: Span[Byte, origin]) -> Bool:

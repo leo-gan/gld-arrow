@@ -1,7 +1,7 @@
 from std.collections import List, Span
 
 from compress.frame import frame_compress, frame_decompress
-from runtime.buf import put_i64, put_u32
+from runtime.buf import copy_span, extend_list, put_i64, put_u32
 from runtime.error import DecodeError
 from runtime.flatbuf import FBBuilder, FBReader
 from runtime.model import (
@@ -23,6 +23,7 @@ from runtime.model import (
     TY_UTF8_VIEW,
     MAX_DEPTH,
     ArrayRec,
+    BufRec,
     Columnar,
     DictRec,
     FieldRec,
@@ -111,11 +112,28 @@ def _u32[origin: ImmOrigin](raw: Span[Byte, origin], i: Int) raises DecodeError 
 
 
 def _write_stream(c: Columnar, mut out: List[Byte], file_pad: Bool) raises DecodeError:
-    var a = List[Int]()
-    var b = List[Int]()
-    var d = List[Int]()
-    var e = List[Int]()
-    _write_stream_tracked(c, out, a, b, d, e)
+    var schema_meta = _message_bytes(c, 1, -1, 0)
+    _append_meta(out, schema_meta)
+    var di = 0
+    var bi = 0
+    while bi < len(c.batches):
+        while di < len(c.dicts) and c.dicts[di].batch_index == bi:
+            var body = List[Byte]()
+            var meta = _dict_meta(c, c.dicts[di], body)
+            _append_encapsulated(out, meta, body)
+            di += 1
+        var body = List[Byte]()
+        var meta = _batch_meta(c, bi, body)
+        _append_encapsulated(out, meta, body)
+        bi += 1
+    while di < len(c.dicts):
+        var body = List[Byte]()
+        var meta = _dict_meta(c, c.dicts[di], body)
+        _append_encapsulated(out, meta, body)
+        di += 1
+    _ = file_pad
+    put_u32(out, 0xFFFFFFFF)
+    put_u32(out, 0)
 
 
 def _write_stream_tracked(
@@ -152,18 +170,9 @@ def _write_dict(
     mut blocks_body: List[Int],
     mut blocks_kind: List[Int],
 ) raises DecodeError:
-    var nodes_l = List[Int]()
-    var nodes_n = List[Int]()
-    var order = List[Int]()
-    var variadic = List[Int]()
-    var f = c.fields[c.arrays[d.array].field]
-    _emit_array(c, f, d.array, True, nodes_l, nodes_n, order, variadic, 0)
     var body = List[Byte]()
-    var boff = List[Int]()
-    var blen = List[Int]()
-    _pack_body(c, order, c.codec, body, boff, blen)
-    var batch_tok_buf = _batch_message(c, c.arrays[d.array].length, nodes_l, nodes_n, boff, blen, variadic, c.codec, len(body), 2, d)
-    _record_block(out, batch_tok_buf, body, 2, blocks_off, blocks_meta, blocks_body, blocks_kind)
+    var meta = _dict_meta(c, d, body)
+    _record_block(out, meta, body, 2, blocks_off, blocks_meta, blocks_body, blocks_kind)
 
 
 def _write_batch(
@@ -175,25 +184,8 @@ def _write_batch(
     mut blocks_body: List[Int],
     mut blocks_kind: List[Int],
 ) raises DecodeError:
-    var batch = c.batches[bi]
-    var nodes_l = List[Int]()
-    var nodes_n = List[Int]()
-    var order = List[Int]()
-    var variadic = List[Int]()
-    var i = 0
-    while i < batch.ncol:
-        var aid = c.batch_cols[batch.col0 + i]
-        var f = c.fields[c.arrays[aid].field]
-        _emit_array(c, f, aid, False, nodes_l, nodes_n, order, variadic, 0)
-        i += 1
-    var codec = batch.codec
-    if codec < 0:
-        codec = c.codec
     var body = List[Byte]()
-    var boff = List[Int]()
-    var blen = List[Int]()
-    _pack_body(c, order, codec, body, boff, blen)
-    var meta = _batch_message(c, batch.length, nodes_l, nodes_n, boff, blen, variadic, codec, len(body), 3, DictRec(-1, -1, 0, 0))
+    var meta = _batch_meta(c, bi, body)
     _record_block(out, meta, body, 3, blocks_off, blocks_meta, blocks_body, blocks_kind)
 
 
@@ -211,20 +203,8 @@ def _batch_message(
     d: DictRec,
 ) raises DecodeError -> List[Byte]:
     var b = FBBuilder()
-    var nodes = List[Byte]()
-    var i = 0
-    while i < len(nodes_l):
-        put_i64(nodes, nodes_l[i])
-        put_i64(nodes, nodes_n[i])
-        i += 1
-    var bufs = List[Byte]()
-    i = 0
-    while i < len(boff):
-        put_i64(bufs, boff[i])
-        put_i64(bufs, blen[i])
-        i += 1
-    var ntok = b.write_struct_vec(nodes, 16)
-    var btok = b.write_struct_vec(bufs, 16)
+    var ntok = b.write_i64_pairs(nodes_l, nodes_n)
+    var btok = b.write_i64_pairs(boff, blen)
     var ctok = -1
     if codec >= 0:
         b.start_table(2)
@@ -293,15 +273,15 @@ def _pack_body(
         else:
             while len(body) % 8 != 0:
                 body.append(Byte(0))
-            var payload = src.copy()
             if codec >= 0:
-                payload = _wrap_compress(codec, src)
-            boff.append(len(body))
-            blen.append(len(payload))
-            var k = 0
-            while k < len(payload):
-                body.append(payload[k])
-                k += 1
+                var payload = _wrap_compress(codec, src)
+                boff.append(len(body))
+                blen.append(len(payload))
+                extend_list(body, payload)
+            else:
+                boff.append(len(body))
+                blen.append(len(src))
+                extend_list(body, src)
         i += 1
     while len(body) % 8 != 0:
         body.append(Byte(0))
@@ -312,33 +292,76 @@ def _wrap_compress(codec: Int, raw: List[Byte]) raises DecodeError -> List[Byte]
     var out = List[Byte]()
     if len(comp) >= len(raw):
         put_i64(out, -1)
-        var i = 0
-        while i < len(raw):
-            out.append(raw[i])
-            i += 1
+        extend_list(out, raw)
     else:
         put_i64(out, len(raw))
-        var i = 0
-        while i < len(comp):
-            out.append(comp[i])
-            i += 1
+        extend_list(out, comp)
     return out^
 
 
-def _append_encapsulated(mut out: List[Byte], meta: List[Byte], body: List[Byte]):
-    var m = meta.copy()
-    while len(m) % 8 != 0:
-        m.append(Byte(0))
+def _append_meta(mut out: List[Byte], meta: List[Byte]):
+    var pad = 0
+    if len(meta) % 8 != 0:
+        pad = 8 - (len(meta) % 8)
     put_u32(out, 0xFFFFFFFF)
-    put_u32(out, len(m))
+    put_u32(out, len(meta) + pad)
+    extend_list(out, meta)
     var i = 0
-    while i < len(m):
-        out.append(m[i])
+    while i < pad:
+        out.append(Byte(0))
         i += 1
-    i = 0
-    while i < len(body):
-        out.append(body[i])
+
+
+def _batch_meta(c: Columnar, bi: Int, mut body: List[Byte]) raises DecodeError -> List[Byte]:
+    var batch = c.batches[bi]
+    var nodes_l = List[Int]()
+    var nodes_n = List[Int]()
+    var order = List[Int]()
+    var variadic = List[Int]()
+    var i = 0
+    while i < batch.ncol:
+        var aid = c.batch_cols[batch.col0 + i]
+        var f = c.fields[c.arrays[aid].field]
+        _emit_array(c, f, aid, False, nodes_l, nodes_n, order, variadic, 0)
         i += 1
+    var codec = batch.codec
+    if codec < 0:
+        codec = c.codec
+    var boff = List[Int]()
+    var blen = List[Int]()
+    _pack_body(c, order, codec, body, boff, blen)
+    return _batch_message(
+        c, batch.length, nodes_l, nodes_n, boff, blen, variadic, codec, len(body), 3, DictRec(-1, -1, 0, 0)
+    )
+
+
+def _dict_meta(c: Columnar, d: DictRec, mut body: List[Byte]) raises DecodeError -> List[Byte]:
+    var nodes_l = List[Int]()
+    var nodes_n = List[Int]()
+    var order = List[Int]()
+    var variadic = List[Int]()
+    var f = c.fields[c.arrays[d.array].field]
+    _emit_array(c, f, d.array, True, nodes_l, nodes_n, order, variadic, 0)
+    var boff = List[Int]()
+    var blen = List[Int]()
+    _pack_body(c, order, c.codec, body, boff, blen)
+    return _batch_message(
+        c, c.arrays[d.array].length, nodes_l, nodes_n, boff, blen, variadic, c.codec, len(body), 2, d
+    )
+
+
+def _append_encapsulated(mut out: List[Byte], meta: List[Byte], body: List[Byte]):
+    var pad = 0
+    if len(meta) % 8 != 0:
+        pad = 8 - (len(meta) % 8)
+    put_u32(out, 0xFFFFFFFF)
+    put_u32(out, len(meta) + pad)
+    extend_list(out, meta)
+    var i = 0
+    while i < pad:
+        out.append(Byte(0))
+        i += 1
+    extend_list(out, body)
 
 
 def _record_block(
@@ -352,11 +375,11 @@ def _record_block(
     mut blocks_kind: List[Int],
 ):
     var start = len(out)
-    var m = meta.copy()
-    while len(m) % 8 != 0:
-        m.append(Byte(0))
+    var padded = len(meta)
+    if padded % 8 != 0:
+        padded += 8 - (padded % 8)
     blocks_off.append(start)
-    blocks_meta.append(8 + len(m))
+    blocks_meta.append(8 + padded)
     blocks_body.append(len(body))
     blocks_kind.append(kind)
     _append_encapsulated(out, meta, body)
@@ -489,11 +512,7 @@ def _ingest[origin: ImmOrigin](mut c: Columnar, raw: Span[Byte, origin], begin: 
             return
         if mlen < 0 or i + 8 + mlen > end:
             raise DecodeError(DecodeError.KIND_RANGE, i)
-        var meta = List[Byte]()
-        var k = 0
-        while k < mlen:
-            meta.append(raw[i + 8 + k])
-            k += 1
+        var meta = copy_span(raw, i + 8, mlen)
         var r = FBReader(meta^)
         var table = r.root()
         var ver_p = r.field(table, 0)
@@ -515,27 +534,23 @@ def _ingest[origin: ImmOrigin](mut c: Columnar, raw: Span[Byte, origin], begin: 
         var body_at = i + 8 + mlen
         if body_len < 0 or body_at + body_len > end:
             raise DecodeError(DecodeError.KIND_RANGE, body_at)
-        var body = List[Byte]()
-        k = 0
-        while k < body_len:
-            body.append(raw[body_at + k])
-            k += 1
         if hkind == 1:
             decode_schema(r, header, c)
         elif hkind == 2:
-            _read_dictionary(c, r, header, body)
+            _read_dictionary(c, r, header, raw, body_at)
         elif hkind == 3:
-            _read_batch(c, r, header, body)
-        elif hkind == 4:
-            read_tensor(c, r, header, body, False)
-        elif hkind == 5:
-            read_tensor(c, r, header, body, True)
+            _read_batch(c, r, header, raw, body_at)
+        elif hkind == 4 or hkind == 5:
+            var body = copy_span(raw, body_at, body_len)
+            read_tensor(c, r, header, body, hkind == 5)
         else:
             raise DecodeError(DecodeError.KIND_TYPE, hkind)
         i = body_at + body_len
 
 
-def _read_dictionary(mut c: Columnar, r: FBReader, table: Int, body: List[Byte]) raises DecodeError:
+def _read_dictionary[origin: ImmOrigin](
+    mut c: Columnar, r: FBReader, table: Int, raw: Span[Byte, origin], body_at: Int
+) raises DecodeError:
     var id = 0
     var ip = r.field(table, 0)
     if ip >= 0:
@@ -548,7 +563,7 @@ def _read_dictionary(mut c: Columnar, r: FBReader, table: Int, body: List[Byte])
     if bp < 0:
         raise DecodeError(DecodeError.KIND_SCHEMA, table)
     var field_id = _field_for_dict(c, id)
-    var aid = _read_one_array(c, r, r.follow(bp), body, field_id, True, 0)
+    var aid = _read_one_array(c, r, r.follow(bp), raw, body_at, field_id, True, 0)
     c.dicts.append(DictRec(id, aid, delta, len(c.batches)))
 
 
@@ -561,7 +576,9 @@ def _field_for_dict(c: Columnar, id: Int) raises DecodeError -> Int:
     raise DecodeError(DecodeError.KIND_SCHEMA, id)
 
 
-def _read_batch(mut c: Columnar, r: FBReader, table: Int, body: List[Byte]) raises DecodeError:
+def _read_batch[origin: ImmOrigin](
+    mut c: Columnar, r: FBReader, table: Int, raw: Span[Byte, origin], body_at: Int
+) raises DecodeError:
     var length = 0
     var lp = r.field(table, 0)
     if lp >= 0:
@@ -570,8 +587,9 @@ def _read_batch(mut c: Columnar, r: FBReader, table: Int, body: List[Byte]) rais
     var i = 0
     var state = _BatchState()
     _load_batch_vectors(r, table, state)
+    _reserve_body(c, state)
     while i < len(c.top):
-        var aid = _read_array_state(c, body, c.top[i], False, state, 0)
+        var aid = _read_array_state(c, raw, body_at, c.top[i], False, state, 0)
         cols.append(aid)
         i += 1
     var codec = state.codec
@@ -594,6 +612,7 @@ struct _BatchState:
     var buf_i: Int
     var var_i: Int
     var codec: Int
+    var byte_cursor: Int
 
     def __init__(out self):
         self.node_l = List[Int]()
@@ -605,6 +624,7 @@ struct _BatchState:
         self.buf_i = 0
         self.var_i = 0
         self.codec = -1
+        self.byte_cursor = -1
 
 
 def _load_batch_vectors(r: FBReader, table: Int, mut st: _BatchState) raises DecodeError:
@@ -644,16 +664,30 @@ def _load_batch_vectors(r: FBReader, table: Int, mut st: _BatchState) raises Dec
             i += 1
 
 
-def _read_one_array(
-    mut c: Columnar, r: FBReader, batch_table: Int, body: List[Byte], field_id: Int, as_values: Bool, depth: Int
+def _read_one_array[origin: ImmOrigin](
+    mut c: Columnar,
+    r: FBReader,
+    batch_table: Int,
+    raw: Span[Byte, origin],
+    body_at: Int,
+    field_id: Int,
+    as_values: Bool,
+    depth: Int,
 ) raises DecodeError -> Int:
     var st = _BatchState()
     _load_batch_vectors(r, batch_table, st)
-    return _read_array_state(c, body, field_id, as_values, st, depth)
+    _reserve_body(c, st)
+    return _read_array_state(c, raw, body_at, field_id, as_values, st, depth)
 
 
-def _read_array_state(
-    mut c: Columnar, body: List[Byte], field_id: Int, as_values: Bool, mut st: _BatchState, depth: Int
+def _read_array_state[origin: ImmOrigin](
+    mut c: Columnar,
+    raw: Span[Byte, origin],
+    body_at: Int,
+    field_id: Int,
+    as_values: Bool,
+    mut st: _BatchState,
+    depth: Int,
 ) raises DecodeError -> Int:
     if depth > MAX_DEPTH:
         raise DecodeError(DecodeError.KIND_DEPTH, depth)
@@ -669,7 +703,7 @@ def _read_array_state(
     a.null_count = null_count
     a.buf0 = len(c.abufs)
     if f.dict_id >= 0 and not as_values:
-        _take_n(c, body, st, 2, 0)
+        _take_n(c, raw, body_at, st, 2, 0)
         a.nbuf = 2
         a.dict = _latest_dict(c, f.dict_id)
         return c.push_array(a)
@@ -677,19 +711,19 @@ def _read_array_state(
     var swap_w = 0
     if c.endian != 0:
         swap_w = byte_width_of(f)
-    _take_n(c, body, st, local, swap_w)
+    _take_n(c, raw, body_at, st, local, swap_w)
     var extra = 0
     if is_variadic(f.kind):
         if st.var_i >= len(st.variadic):
             raise DecodeError(DecodeError.KIND_SCHEMA, st.var_i)
         extra = st.variadic[st.var_i]
         st.var_i += 1
-        _take_n(c, body, st, extra, 0)
+        _take_n(c, raw, body_at, st, extra, 0)
     a.nbuf = local + extra
     var direct = List[Int]()
     var ch = 0
     while ch < f.nchild:
-        direct.append(_read_array_state(c, body, c.kids[f.child0 + ch], False, st, depth + 1))
+        direct.append(_read_array_state(c, raw, body_at, c.kids[f.child0 + ch], False, st, depth + 1))
         ch += 1
     a.child0 = len(c.achilds)
     ch = 0
@@ -698,6 +732,21 @@ def _read_array_state(
         ch += 1
     a.nchild = len(direct)
     return c.push_array(a)
+
+
+def _reserve_body(mut c: Columnar, mut st: _BatchState):
+    if st.codec >= 0:
+        st.byte_cursor = -1
+        return
+    var need = 0
+    var i = 0
+    while i < len(st.buf_len):
+        if st.buf_len[i] > 0:
+            need += st.buf_len[i]
+        i += 1
+    st.byte_cursor = len(c.bytes)
+    if need > 0:
+        c.bytes.resize(st.byte_cursor + need, Byte(0))
 
 
 def _latest_dict(c: Columnar, id: Int) -> Int:
@@ -717,7 +766,9 @@ def _latest_dict(c: Columnar, id: Int) -> Int:
     return repl
 
 
-def _take_n(mut c: Columnar, body: List[Byte], mut st: _BatchState, n: Int, swap_w: Int) raises DecodeError:
+def _take_n[origin: ImmOrigin](
+    mut c: Columnar, raw: Span[Byte, origin], body_at: Int, mut st: _BatchState, n: Int, swap_w: Int
+) raises DecodeError:
     var i = 0
     while i < n:
         if st.buf_i >= len(st.buf_off):
@@ -725,36 +776,46 @@ def _take_n(mut c: Columnar, body: List[Byte], mut st: _BatchState, n: Int, swap
         var off = st.buf_off[st.buf_i]
         var ln = st.buf_len[st.buf_i]
         st.buf_i += 1
-        var bytes = _slice_body(body, off, ln, st.codec)
-        if swap_w > 1 and i == 1 and len(bytes) > 0:
-            swap_fixed(bytes, swap_w)
-        if len(bytes) == 0:
+        var abs = body_at + off
+        if ln == 0:
             c.abufs.append(c.add_empty_buf())
+        elif st.byte_cursor >= 0 and (swap_w <= 1 or i != 1):
+            if abs < 0 or ln < 0 or abs + ln > len(raw):
+                raise DecodeError(DecodeError.KIND_RANGE, off)
+            var dest = st.byte_cursor
+            var k = 0
+            while k < ln:
+                c.bytes[dest + k] = raw[abs + k]
+                k += 1
+            st.byte_cursor = dest + ln
+            var id = len(c.bufs)
+            c.bufs.append(BufRec(dest, ln))
+            c.abufs.append(id)
         else:
-            c.abufs.append(c.add_buf_list(bytes))
+            var bytes = _slice_body_span(raw, abs, ln, st.codec)
+            if swap_w > 1 and i == 1 and len(bytes) > 0:
+                swap_fixed(bytes, swap_w)
+            if len(bytes) == 0:
+                c.abufs.append(c.add_empty_buf())
+            else:
+                c.abufs.append(c.add_buf_list(bytes))
         i += 1
 
 
-def _slice_body(body: List[Byte], off: Int, n: Int, codec: Int) raises DecodeError -> List[Byte]:
+def _slice_body_span[origin: ImmOrigin](
+    raw: Span[Byte, origin], off: Int, n: Int, codec: Int
+) raises DecodeError -> List[Byte]:
     if n == 0:
         return List[Byte]()
-    if off < 0 or n < 0 or off + n > len(body):
+    if off < 0 or n < 0 or off + n > len(raw):
         raise DecodeError(DecodeError.KIND_RANGE, off)
-    var raw = List[Byte]()
-    var i = 0
-    while i < n:
-        raw.append(body[off + i])
-        i += 1
+    var chunk = copy_span(raw, off, n)
     if codec < 0:
-        return raw^
-    if len(raw) < 8:
+        return chunk^
+    if len(chunk) < 8:
         raise DecodeError(DecodeError.KIND_COMPRESSION, off)
-    var un = read_width(raw, 0, 8, True)
-    var rest = List[Byte]()
-    i = 8
-    while i < len(raw):
-        rest.append(raw[i])
-        i += 1
+    var un = read_width(chunk, 0, 8, True)
+    var rest = copy_span(Span(chunk), 8, len(chunk) - 8)
     if un < 0:
         return rest^
     var got = frame_decompress(codec, rest)
