@@ -243,15 +243,30 @@ struct Columnar:
     def add_buf[origin: ImmOrigin](mut self, raw: Span[Byte, origin]) -> Int:
         var id = len(self.bufs)
         var off = len(self.bytes)
-        var i = 0
-        while i < len(raw):
-            self.bytes.append(raw[i])
-            i += 1
-        self.bufs.append(BufRec(off, len(raw)))
+        var n = len(raw)
+        if n > 0:
+            self.bytes.resize(off + n, Byte(0))
+            var i = 0
+            while i < n:
+                self.bytes[off + i] = raw[i]
+                i += 1
+        self.bufs.append(BufRec(off, n))
         return id
 
     def add_buf_list(mut self, raw: List[Byte]) -> Int:
         return self.add_buf(Span(raw))
+
+    def add_buf_at[origin: ImmOrigin](mut self, raw: Span[Byte, origin], off: Int, n: Int) -> Int:
+        var id = len(self.bufs)
+        var dest = len(self.bytes)
+        if n > 0:
+            self.bytes.resize(dest + n, Byte(0))
+            var i = 0
+            while i < n:
+                self.bytes[dest + i] = raw[off + i]
+                i += 1
+        self.bufs.append(BufRec(dest if n > 0 else 0, n))
+        return id
 
     def add_empty_buf(mut self) -> Int:
         var id = len(self.bufs)
@@ -263,9 +278,12 @@ struct Columnar:
         if id < 0:
             return out^
         var b = self.bufs[id]
+        if b.length <= 0:
+            return out^
+        out.resize(b.length, Byte(0))
         var i = 0
         while i < b.length:
-            out.append(self.bytes[b.off + i])
+            out[i] = self.bytes[b.off + i]
             i += 1
         return out^
 

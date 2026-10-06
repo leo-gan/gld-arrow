@@ -1,6 +1,6 @@
 from std.collections import List, Span
 
-from runtime.buf import list_i32, list_u16, list_u32, list_u64, set_u16, set_u32, set_u64, string_from
+from runtime.buf import copy_span, list_i32, list_u16, list_u32, list_u64, set_u16, set_u32, set_u64, string_from
 from runtime.error import DecodeError
 
 
@@ -21,7 +21,7 @@ struct FBBuilder:
 
     def __init__(out self):
         self.data = List[Byte]()
-        self.data.resize(262144, Byte(0))
+        self.data.resize(2048, Byte(0))
         self.cursor = len(self.data)
         self.field_at = List[Int]()
         self.nfields = 0
@@ -69,10 +69,11 @@ struct FBBuilder:
         self.cursor -= size
 
     def start_table(mut self, nfields: Int):
-        self.field_at = List[Int]()
+        while len(self.field_at) < nfields:
+            self.field_at.append(-1)
         var i = 0
         while i < nfields:
-            self.field_at.append(-1)
+            self.field_at[i] = -1
             i += 1
         self.nfields = nfields
         self.high = self.cursor
@@ -147,23 +148,18 @@ struct FBBuilder:
         set_u32(self.data, table, 0)
         var table_tok = self._tok(table)
         var obj = self.high - table
-        var vt = List[Byte]()
         var vtsize = 4 + 2 * self.nfields
-        _put_u16_list(vt, vtsize)
-        _put_u16_list(vt, obj)
+        self.place(vtsize, 2)
+        table = self._abs(table_tok)
+        set_u16(self.data, self.cursor, vtsize)
+        set_u16(self.data, self.cursor + 2, obj)
         var i = 0
         while i < self.nfields:
             var rel = 0
             if self.field_at[i] >= 0:
                 rel = self.field_at[i] - table
-            _put_u16_list(vt, rel)
+            set_u16(self.data, self.cursor + 4 + i * 2, rel)
             i += 1
-        self.place(len(vt), 2)
-        table = self._abs(table_tok)
-        var k = 0
-        while k < len(vt):
-            self.data[self.cursor + k] = vt[k]
-            k += 1
         var soff = table - self.cursor
         var u = soff
         if u < 0:
@@ -188,14 +184,14 @@ struct FBBuilder:
         var mis = (self.cursor - total) % 4
         if mis != 0:
             self.cursor -= mis
+        var start = self.cursor - total
+        var i = 0
+        while i < n:
+            self.data[start + i] = raw[i]
+            i += 1
         if null_term:
-            self.cursor -= 1
-            self.data[self.cursor] = Byte(0)
-        var i = n - 1
-        while i >= 0:
-            self.cursor -= 1
-            self.data[self.cursor] = raw[i]
-            i -= 1
+            self.data[start + n] = Byte(0)
+        self.cursor = start
         self.place(4, 4)
         set_u32(self.data, self.cursor, n)
         return self._tok(self.cursor)
@@ -249,6 +245,23 @@ struct FBBuilder:
         set_u32(self.data, self.cursor, len(targets))
         return self._tok(self.cursor)
 
+    def write_i64_pairs(mut self, first: List[Int], second: List[Int]) -> Int:
+        var n = len(first)
+        var nbytes = n * 16
+        self._grow(nbytes + 16)
+        var mis = (self.cursor - nbytes) % 8
+        if mis != 0:
+            self.cursor -= mis
+        var i = n - 1
+        while i >= 0:
+            self.cursor -= 16
+            set_u64(self.data, self.cursor, UInt64(first[i]))
+            set_u64(self.data, self.cursor + 8, UInt64(second[i]))
+            i -= 1
+        self.place(4, 4)
+        set_u32(self.data, self.cursor, n)
+        return self._tok(self.cursor)
+
     def write_struct_vec(mut self, raw: List[Byte], elem: Int) -> Int:
         var n = 0
         if elem > 0:
@@ -273,17 +286,14 @@ struct FBBuilder:
         self.place(4, 8)
         var root = self._abs(tok)
         set_u32(self.data, self.cursor, root - self.cursor)
+        var n = len(self.data) - self.cursor
         var out = List[Byte]()
-        var i = self.cursor
-        while i < len(self.data):
-            out.append(self.data[i])
+        out.resize(n, Byte(0))
+        var i = 0
+        while i < n:
+            out[i] = self.data[self.cursor + i]
             i += 1
         return out^
-
-
-def _put_u16_list(mut b: List[Byte], v: Int):
-    b.append(Byte(v & 255))
-    b.append(Byte((v >> 8) & 255))
 
 
 struct FBReader:
@@ -331,25 +341,15 @@ struct FBReader:
         var n = list_u32(self.data, at)
         if n < 0 or at + 4 + n > len(self.data):
             raise DecodeError(DecodeError.KIND_SYNTAX, at)
-        var tmp = List[Byte]()
-        var i = 0
-        while i < n:
-            tmp.append(self.data[at + 4 + i])
-            i += 1
-        var text = string_from(Span(tmp))
-        return text
+        var tmp = copy_span(Span(self.data), at + 4, n)
+        return string_from(Span(tmp))
 
     def bytes_at(self, pos: Int) raises DecodeError -> List[Byte]:
         var at = self.follow(pos)
         var n = list_u32(self.data, at)
         if n < 0 or at + 4 + n > len(self.data):
             raise DecodeError(DecodeError.KIND_SYNTAX, at)
-        var out = List[Byte]()
-        var i = 0
-        while i < n:
-            out.append(self.data[at + 4 + i])
-            i += 1
-        return out^
+        return copy_span(Span(self.data), at + 4, n)
 
     def u8(self, pos: Int) raises DecodeError -> Int:
         if pos < 0 or pos >= len(self.data):
