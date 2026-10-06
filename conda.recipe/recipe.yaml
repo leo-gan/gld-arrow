@@ -1,0 +1,53 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/prefix-dev/recipe-format/main/schema.json
+context:
+  version: "0.1.0"
+
+package:
+  name: mojo-arrow
+  version: ${{ version }}
+
+source:
+  path: ..
+
+build:
+  number: 0
+  script:
+    - mkdir -p ${{ PREFIX }}/lib/mojo ${{ PREFIX }}/bin
+    - mojo precompile -I src src/runtime -o ${{ PREFIX }}/lib/mojo/runtime.mojoc
+    - mojo precompile -I src src/compress -o ${{ PREFIX }}/lib/mojo/compress.mojoc
+    - mojo precompile -I src src/schema -o ${{ PREFIX }}/lib/mojo/schema.mojoc
+    - mojo precompile -I src src/wire -o ${{ PREFIX }}/lib/mojo/wire.mojoc
+    - mojo precompile -I src src/cabi -o ${{ PREFIX }}/lib/mojo/cabi.mojoc
+    - mojo precompile -I src src/flight -o ${{ PREFIX }}/lib/mojo/flight.mojoc
+    - mojo precompile -I src src/arrow -o ${{ PREFIX }}/lib/mojo/arrow.mojoc
+    - mojo build -I src src/codegen/cli.mojo -o ${{ PREFIX }}/bin/gld-arrowgen-mojo
+
+requirements:
+  build:
+    - mojo-compiler ==1.1.0
+  host:
+    - mojo-compiler ==1.1.0
+  run:
+    - ${{ pin_compatible('mojo-compiler') }}
+
+tests:
+  - script:
+      - if: unix
+        then:
+          - mojo run test_import.mojo
+          - gld-arrowgen-mojo --help
+    files:
+      recipe:
+        - test_import.mojo
+
+about:
+  homepage: https://leo-gan.github.io/gld-arrow/
+  repository: https://github.com/leo-gan/gld-arrow
+  documentation: https://leo-gan.github.io/gld-arrow/
+  license: MIT
+  license_file: LICENSE
+  summary: From-scratch Apache Arrow columnar, IPC, and Flight library for Mojo
+  description: |
+    Runtime and code generator written in Mojo. Does not wrap a C, C++, or
+    Rust Arrow library. The package installs arrow.mojoc and the
+    gld-arrowgen-mojo CLI.
